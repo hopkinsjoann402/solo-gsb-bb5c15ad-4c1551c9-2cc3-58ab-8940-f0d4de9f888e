@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.scoring import (
     MAD_K,
     analyze,
+    compare_contestants,
     competition_rank,
     robust_params,
     stability_experiment,
@@ -253,6 +254,142 @@ class TestStabilityExperiment(unittest.TestCase):
             stability_experiment(self.records, {}, "judge", "judge", "NOBODY")
         with self.assertRaises(ValueError):
             stability_experiment(self.records, {}, "judge", "round", "P1")
+
+
+class TestCompareContestants(unittest.TestCase):
+    def setUp(self):
+        # 2 contestants x 2 judges x 2 items; JA low/tight, JB high/wide.
+        self.data = [
+            ("C1", "JA", "I1", 8.0),
+            ("C2", "JA", "I1", 7.0),
+            ("C1", "JA", "I2", 9.0),
+            ("C2", "JA", "I2", 6.0),
+            ("C1", "JB", "I1", 12.0),
+            ("C2", "JB", "I1", 10.0),
+            ("C1", "JB", "I2", 13.0),
+            ("C2", "JB", "I2", 9.0),
+        ]
+
+    def test_totals_and_item_gaps(self):
+        a = analyze(recs(self.data), {}, "judge")
+        cmp = compare_contestants(a, "C1", "C2")
+        blocks = {b["contestant"]: b for b in a["contestants"]}
+
+        self.assertEqual(cmp["a"]["contestant"], "C1")
+        self.assertEqual(cmp["b"]["contestant"], "C2")
+        self.assertEqual(len(cmp["items"]), 2)
+
+        # C1 wins both items in every kind: 2 leads / 0 ties / 0 no-data.
+        for kind in ("raw", "cal", "eff"):
+            st = cmp["summary"][kind]
+            self.assertEqual((st["a_leads"], st["b_leads"], st["ties"], st["no_data"]),
+                             (2, 0, 0, 0))
+            t = cmp["totals"][kind]
+            self.assertAlmostEqual(t["a"], blocks["C1"][f"{kind}_total"])
+            self.assertAlmostEqual(t["b"], blocks["C2"][f"{kind}_total"])
+            self.assertAlmostEqual(t["diff"],
+                                   blocks["C1"][f"{kind}_total"] - blocks["C2"][f"{kind}_total"])
+            self.assertEqual(t["leader"], "a")
+            self.assertEqual(t["a_rank"], blocks["C1"][f"{kind}_rank"])
+
+        # Item rows carry per-kind values/gaps matching the analysis blocks.
+        i1 = next(r for r in cmp["items"] if r["item"] == "I1")
+        c2_i1 = next(ib for ib in blocks["C2"]["items"] if ib["item"] == "I1")
+        self.assertAlmostEqual(i1["b_raw"], c2_i1["raw_avg"])
+        self.assertAlmostEqual(i1["raw_diff"],
+                               next(ib for ib in blocks["C1"]["items"] if ib["item"] == "I1")["raw_avg"]
+                               - c2_i1["raw_avg"])
+        self.assertEqual(i1["raw_leader"], "a")
+        self.assertTrue(i1["a_present"] and i1["b_present"])
+        self.assertEqual(i1["a_n_scores"], 2)
+
+    def test_missing_item_is_no_data_not_zero(self):
+        # C2 has no scores at all for I2.
+        data = [r for r in self.data if not (r[0] == "C2" and r[2] == "I2")]
+        a = analyze(recs(data), {}, "judge")
+        cmp = compare_contestants(a, "C1", "C2")
+
+        i2 = next(r for r in cmp["items"] if r["item"] == "I2")
+        self.assertTrue(i2["a_present"])
+        self.assertFalse(i2["b_present"])
+        self.assertEqual(i2["b_n_scores"], 0)
+        for kind in ("raw", "cal", "eff"):
+            self.assertIsNotNone(i2[f"a_{kind}"])
+            self.assertIsNone(i2[f"b_{kind}"])
+            self.assertIsNone(i2[f"{kind}_diff"])
+            self.assertEqual(i2[f"{kind}_leader"], "none")
+            # I1 still comparable; I2 excluded from win/tie stats.
+            st = cmp["summary"][kind]
+            self.assertEqual((st["a_leads"], st["b_leads"], st["ties"], st["no_data"]),
+                             (1, 0, 0, 1))
+
+        # Totals remain independently computed (C2's total sums only I1).
+        blocks = {b["contestant"]: b for b in a["contestants"]}
+        self.assertAlmostEqual(cmp["totals"]["raw"]["b"], blocks["C2"]["raw_total"])
+        # I1 alone is smaller than C1's two-item total; the gap is still judged.
+        self.assertEqual(cmp["totals"]["raw"]["leader"], "a")
+
+    def test_reverse_order_flips_direction(self):
+        a = analyze(recs(self.data), {}, "judge")
+        cmp = compare_contestants(a, "C2", "C1")
+        self.assertEqual(cmp["totals"]["raw"]["leader"], "b")
+        self.assertAlmostEqual(
+            cmp["totals"]["raw"]["diff"],
+            -compare_contestants(a, "C1", "C2")["totals"]["raw"]["diff"],
+        )
+        i1 = next(r for r in cmp["items"] if r["item"] == "I1")
+        self.assertEqual(i1["raw_leader"], "b")
+        self.assertEqual(cmp["summary"]["raw"]["b_leads"], 2)
+
+    def test_exact_item_tie_counts_as_tie(self):
+        # Equal averages on I1, different on I2.
+        data = [
+            ("C1", "JA", "I1", 8.0), ("C2", "JA", "I1", 8.0),
+            ("C1", "JB", "I1", 10.0), ("C2", "JB", "I1", 10.0),
+            ("C1", "JA", "I2", 9.0), ("C2", "JA", "I2", 6.0),
+            ("C1", "JB", "I2", 11.0), ("C2", "JB", "I2", 9.0),
+        ]
+        a = analyze(recs(data), {}, "judge")
+        cmp = compare_contestants(a, "C1", "C2")
+        i1 = next(r for r in cmp["items"] if r["item"] == "I1")
+        self.assertEqual(i1["raw_leader"], "tie")
+        self.assertEqual(i1["raw_diff"], 0.0)
+        st = cmp["summary"]["raw"]
+        self.assertEqual((st["a_leads"], st["ties"]), (1, 1))
+
+    def test_effective_gap_follows_decisions(self):
+        # Overriding all of C1's scores to raw only changes the "eff" comparison.
+        records = recs(self.data)
+        decisions = {
+            r["id"]: (True, "keep raw")
+            for r in records if r["contestant"] == "C1"
+        }
+        a = analyze(records, decisions, "judge")
+        cmp = compare_contestants(a, "C1", "C2")
+        blocks = {b["contestant"]: b for b in a["contestants"]}
+        self.assertAlmostEqual(cmp["totals"]["eff"]["a"], blocks["C1"]["eff_total"])
+        self.assertAlmostEqual(cmp["totals"]["eff"]["b"], blocks["C2"]["eff_total"])
+        # Effective column equals raw column for C1's item rows.
+        i1 = next(r for r in cmp["items"] if r["item"] == "I1")
+        self.assertAlmostEqual(i1["a_eff"], i1["a_raw"])
+        # Raw/cal columns are unaffected by decisions.
+        self.assertAlmostEqual(cmp["totals"]["raw"]["a"], blocks["C1"]["raw_total"])
+
+    def test_scope_label_propagates(self):
+        a = analyze(recs(self.data), {}, "judge_item")
+        cmp = compare_contestants(a, "C1", "C2")
+        self.assertEqual(cmp["scope"], "judge_item")
+        self.assertIn(cmp["scope_label"], (a["scope_label"],))
+        self.assertEqual(set(cmp["kind_labels"]), {"raw", "cal", "eff"})
+
+    def test_errors(self):
+        a = analyze(recs(self.data), {}, "judge")
+        with self.assertRaises(LookupError):
+            compare_contestants(a, "C1", "NOBODY")
+        with self.assertRaises(LookupError):
+            compare_contestants(a, "GHOST", "C1")
+        with self.assertRaises(ValueError):
+            compare_contestants(a, "C1", "C1")
 
 
 if __name__ == "__main__":

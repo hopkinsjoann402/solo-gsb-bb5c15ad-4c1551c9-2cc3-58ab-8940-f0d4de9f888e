@@ -18,7 +18,7 @@ from .rules import (
     normalize_rules,
     score_rows_from_analysis,
 )
-from .scoring import SCOPES, SCOPE_JUDGE, analyze, stability_experiment
+from .scoring import SCOPES, SCOPE_JUDGE, analyze, compare_contestants, stability_experiment
 
 SAMPLE_PATH = os.environ.get(
     "CALIB_SAMPLE_PATH",
@@ -64,6 +64,11 @@ class DecisionBody(BaseModel):
 class StabilityBody(BaseModel):
     exclude_type: Literal["judge", "item"]
     exclude_name: str = Field(min_length=1, max_length=200)
+
+
+class CompareBody(BaseModel):
+    contestant_a: str = Field(min_length=1, max_length=200)
+    contestant_b: str = Field(min_length=1, max_length=200)
 
 
 class RuleBody(BaseModel):
@@ -289,6 +294,30 @@ def stability_check(session_id: str, body: StabilityBody) -> dict[str, Any]:
             records, decisions, scope, body.exclude_type, body.exclude_name.strip()
         )
     except LookupError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/sessions/{session_id}/compare")
+def compare_two(session_id: str, body: CompareBody) -> dict[str, Any]:
+    """Read-only two-contestant comparison derived from the current analysis.
+
+    Never persists anything: the comparison follows the stored scores, the
+    active calibration scope and all human adjudications at request time.
+    """
+    with db.get_conn() as conn:
+        if db.get_scope(conn, session_id) is None:
+            raise HTTPException(status_code=404, detail="会话不存在，请先上传数据。")
+        scope = _resolve_scope(conn, session_id, None)
+        analysis = _build_analysis(conn, session_id, scope)
+    if analysis["counts"]["scores"] == 0:
+        raise HTTPException(status_code=400, detail="当前会话没有评分数据，无法进行对比。")
+    try:
+        return compare_contestants(
+            analysis, body.contestant_a.strip(), body.contestant_b.strip()
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
 

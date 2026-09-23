@@ -19,6 +19,9 @@ let stability = null; // 排名稳定性实验结果（纯前端临时态，不�
 let ruleDraft = null; // 规则编辑器草稿（数组），DOM 是输入中的真实来源
 let rulePreviewData = null; // 最近一次规则预览结果（只读，不落库）
 let rulePreviewStale = false; // 草稿在预览后又被修改
+let comparison = null; // 双选手对比结果（只读派生，不落库、不另存评分）
+let compareReqId = 0; // 对比请求序号，过期响应直接丢弃
+let comparePending = null; // 进行中的请求 {a, b, reqId}，防止连点选择时错配旧结果
 
 const $ = (sel) => document.querySelector(sel);
 const dashboard = $("#dashboard");
@@ -62,7 +65,14 @@ async function api(path, options = {}) {
 }
 
 // ---------- Rendering ----------
+let lastAnalysisRef = null; // 上一次 render 看到的 analysis 对象；对象换了说明数据/裁决已更新
 function render() {
+  if (analysis !== lastAnalysisRef) {
+    lastAnalysisRef = analysis;
+    comparison = null; // 对比是 analysis 的只读派生视图，分析更新即作废并重取
+    comparePending = null;
+    compareReqId++;
+  }
   if (!analysis || analysis.counts.scores === 0) {
     dashboard.hidden = true;
     emptyState.hidden = false;
@@ -91,6 +101,7 @@ function render() {
   initRuleDraft();
   renderDetails();
   renderStability();
+  renderCompare();
 }
 
 // ---------- Ranking stability experiment ----------
@@ -839,6 +850,235 @@ stabilityBtnRun.addEventListener("click", async () => {
 });
 
 stabilityBtnClear.addEventListener("click", () => clearStability());
+
+// ---------- Two-contestant comparison ----------
+const compareSelA = $("#compare-a");
+const compareSelB = $("#compare-b");
+const compareResultEl = $("#compare-result");
+
+function setCompareMsg(text, cls = "") {
+  const el = $("#compare-msg");
+  el.textContent = text;
+  el.className = "msg " + cls;
+}
+
+// Refresh both selects from the current contestant list, keeping selections.
+function syncCompareSelects() {
+  const names = analysis && analysis.counts.scores > 0
+    ? analysis.contestants.map((b) => b.contestant)
+    : [];
+  const prevA = compareSelA.value;
+  const prevB = compareSelB.value;
+  const opts =
+    `<option value="" disabled selected>请选择选手…</option>` +
+    names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+  compareSelA.innerHTML = opts;
+  compareSelB.innerHTML = opts;
+  if (names.includes(prevA)) compareSelA.value = prevA;
+  else if (names.length) compareSelA.value = names[0];
+  if (names.includes(prevB)) compareSelB.value = prevB;
+  else if (names.length > 1) compareSelB.value = names[1];
+  const enabled = names.length >= 2;
+  compareSelA.disabled = !enabled;
+  compareSelB.disabled = !enabled;
+}
+
+function renderCompare() {
+  syncCompareSelects();
+  const a = compareSelA.value;
+  const b = compareSelB.value;
+  // 任何「不展示」分支都让在途请求作废，避免其返回后覆盖面板。
+  const abortView = (msg = "", isError = false) => {
+    comparison = null;
+    comparePending = null;
+    compareReqId++;
+    compareResultEl.innerHTML = "";
+    setCompareMsg(msg, isError ? "error" : "");
+  };
+  if (!analysis || analysis.counts.scores === 0) {
+    abortView();
+    return;
+  }
+  if (analysis.counts.contestants < 2) {
+    abortView("当前数据不足两名选手，无法对比。");
+    return;
+  }
+  if (!a || !b) {
+    abortView("请在两侧各选择一名选手。");
+    return;
+  }
+  if (a === b) {
+    abortView("请选择两名不同的选手。", true);
+    return;
+  }
+  // 选择有效：结果与当前选择不符且没有对应请求在途时，发起/补发展示请求。
+  const matches = (x) => x && x.a === a && x.b === b;
+  if (!matches(comparison)) {
+    if (!matches(comparePending)) requestCompare(a, b); // 在途的是别的选择：作废旧请求并发起新请求
+    return; // 同一对选手的请求仍在途则等其返回
+  }
+  renderCompareResult();
+}
+
+async function requestCompare(a, b) {
+  const reqId = ++compareReqId;
+  comparePending = { a, b, reqId };
+  setCompareMsg("计算中…");
+  try {
+    const data = await api(`/api/sessions/${SESSION_ID}/compare`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contestant_a: a, contestant_b: b }),
+    });
+    if (!comparePending || comparePending.reqId !== reqId) {
+      return; // 已有更新的选择或数据刷新，过期响应丢弃
+    }
+    comparePending = null;
+    comparison = data;
+    setCompareMsg("");
+    renderCompareResult();
+  } catch (err) {
+    if (!comparePending || comparePending.reqId !== reqId) return;
+    comparePending = null;
+    comparison = null;
+    compareResultEl.innerHTML = "";
+    setCompareMsg(err.message, "error");
+  }
+}
+
+function compareVal(v) {
+  return v === null || v === undefined
+    ? `<span class="compare-nodata">无数据</span>`
+    : fmt(v);
+}
+
+// Difference = A − B; null when either side lacks the item.
+function compareDiff(diff) {
+  if (diff === null || diff === undefined) {
+    return `<span class="compare-nodata">—</span>`;
+  }
+  if (diff > 0) return `<span class="delta-up">${signedNum(diff)}</span>`;
+  if (diff < 0) return `<span class="delta-down">${signedNum(diff)}</span>`;
+  return `<span class="delta-flat">0.00（持平）</span>`;
+}
+
+function leaderText(leader, aName, bName) {
+  if (leader === "a") return `<span class="delta-up">${esc(aName)} 领先</span>`;
+  if (leader === "b") return `<span class="delta-down">${esc(bName)} 领先</span>`;
+  if (leader === "tie") return `<span class="delta-flat">持平</span>`;
+  return `<span class="compare-nodata">无数据</span>`;
+}
+
+function summaryPill(kind, label, st, aName, bName) {
+  return `<span class="compare-pill compare-pill-${kind}">
+      <b>${label}</b>：
+      <span class="delta-up">${esc(aName)} ${st.a_leads}</span> 项领先 ／
+      <span class="delta-down">${esc(bName)} ${st.b_leads}</span> 项领先 ／
+      <span class="delta-flat">持平 ${st.ties}</span> 项 ／
+      <span class="compare-nodata">无数据 ${st.no_data}</span> 项
+    </span>`;
+}
+
+function renderCompareResult() {
+  const cmp = comparison;
+  if (!cmp) {
+    compareResultEl.innerHTML = "";
+    return;
+  }
+  const aName = cmp.a.contestant;
+  const bName = cmp.b.contestant;
+
+  const head = `
+    <div class="compare-head">
+      <div class="compare-side compare-side-a">
+        <span class="compare-side-tag">选手 A</span>
+        <b class="compare-name">${esc(aName)}</b>
+        <small>最终名次 ${cmp.totals.eff.a_rank} ｜ ${cmp.a.item_count} 个项目 ｜ 保留原分 ${cmp.a.raw_overrides} 条</small>
+      </div>
+      <div class="compare-vsbig">VS</div>
+      <div class="compare-side compare-side-b">
+        <span class="compare-side-tag">选手 B</span>
+        <b class="compare-name">${esc(bName)}</b>
+        <small>最终名次 ${cmp.totals.eff.b_rank} ｜ ${cmp.b.item_count} 个项目 ｜ 保留原分 ${cmp.b.raw_overrides} 条</small>
+      </div>
+    </div>`;
+
+  // 三类总分对比（差值均为 A − B；总分各自只汇总本人有评分的项目）
+  const totalRows = (["raw", "cal", "eff"]).map((kind) => {
+    const t = cmp.totals[kind];
+    return `
+      <tr>
+        <th>${cmp.kind_labels[kind]}总分</th>
+        <td class="num${t.leader === "a" ? " lead-cell" : ""}">${fmt(t.a)}<br><small>名次 ${t.a_rank}</small></td>
+        <td class="num${t.leader === "b" ? " lead-cell" : ""}">${fmt(t.b)}<br><small>名次 ${t.b_rank}</small></td>
+        <td class="num">${compareDiff(t.diff)}</td>
+        <td>${leaderText(t.leader, aName, bName)}</td>
+      </tr>`;
+  }).join("");
+
+  const totalsTable = `
+    <h3 class="sub">总分对比 <small style="font-weight:400">（差值＝A−B）</small></h3>
+    <div class="table-wrap"><table class="compare-total-table">
+      <tr><th></th><th class="num">${esc(aName)}（A）</th><th class="num">${esc(bName)}（B）</th>
+      <th class="num">差值</th><th>领先方</th></tr>
+      ${totalRows}
+    </table></div>`;
+
+  // 逐项目对比；缺项标无数据，不参与差值/胜负
+  const itemRows = cmp.items.map((r) => {
+    const missingNote = !r.a_present || !r.b_present
+      ? `<br><small class="compare-nodata">${!r.a_present ? esc(aName) + " 无此项目评分" : ""}${!r.a_present && !r.b_present ? "；" : ""}${!r.b_present ? esc(bName) + " 无此项目评分" : ""}</small>`
+      : "";
+    return `
+    <tr${(!r.a_present || !r.b_present) ? ' class="nodata-row"' : ""}>
+      <td><b>${esc(r.item)}</b>
+        <small style="color:var(--muted)">（A ${r.a_n_scores} 位评委 ／ B ${r.b_n_scores} 位评委）</small>${missingNote}</td>
+      <td class="num${r.raw_leader === "a" ? " lead-cell" : ""}">${compareVal(r.a_raw)}</td>
+      <td class="num${r.raw_leader === "b" ? " lead-cell" : ""}">${compareVal(r.b_raw)}</td>
+      <td class="num">${compareDiff(r.raw_diff)}</td>
+      <td>${leaderText(r.raw_leader, aName, bName)}</td>
+      <td class="num${r.cal_leader === "a" ? " lead-cell" : ""}">${compareVal(r.a_cal)}</td>
+      <td class="num${r.cal_leader === "b" ? " lead-cell" : ""}">${compareVal(r.b_cal)}</td>
+      <td class="num">${compareDiff(r.cal_diff)}</td>
+      <td>${leaderText(r.cal_leader, aName, bName)}</td>
+      <td class="num${r.eff_leader === "a" ? " lead-cell" : ""}">${compareVal(r.a_eff)}</td>
+      <td class="num${r.eff_leader === "b" ? " lead-cell" : ""}">${compareVal(r.b_eff)}</td>
+      <td class="num">${compareDiff(r.eff_diff)}</td>
+      <td>${leaderText(r.eff_leader, aName, bName)}</td>
+    </tr>`;
+  }).join("");
+
+  const itemTable = cmp.items.length ? `
+    <h3 class="sub">逐项目得分与差值 <small style="font-weight:400">（项目均分为各评委打分均值；缺项标无数据，不按零分计）</small></h3>
+    <div class="table-wrap"><table class="compare-item-table">
+      <tr>
+        <th rowspan="2">项目</th>
+        <th colspan="4" class="compare-group-head compare-group-raw">原始分</th>
+        <th colspan="4" class="compare-group-head compare-group-cal">校准分</th>
+        <th colspan="4" class="compare-group-head compare-group-eff">最终分</th>
+      </tr>
+      <tr>
+        <th class="num">A</th><th class="num">B</th><th class="num">差值</th><th>领先</th>
+        <th class="num">A</th><th class="num">B</th><th class="num">差值</th><th>领先</th>
+        <th class="num">A</th><th class="num">B</th><th class="num">差值</th><th>领先</th>
+      </tr>
+      ${itemRows}
+    </table></div>` : "";
+
+  const banner = `
+    <div class="compare-banner">
+      校准范围：<b>${esc(cmp.scope_label)}</b> ｜ 逐项目胜负仅统计双方都有评分的项目
+      （无数据不计零、不计入胜负）；总分按各人实际有评分的项目均分求和后直接相减：<br>
+      ${summaryPill("raw", "原始", cmp.summary.raw, aName, bName)}
+      ${summaryPill("cal", "校准", cmp.summary.cal, aName, bName)}
+      ${summaryPill("eff", "最终", cmp.summary.eff, aName, bName)}
+    </div>`;
+
+  compareResultEl.innerHTML = head + totalsTable + itemTable + banner;
+}
+
+compareSelA.addEventListener("change", () => renderCompare());
+compareSelB.addEventListener("change", () => renderCompare());
 
 // ---------- Init ----------
 loadAnalysis();

@@ -376,3 +376,126 @@ def stability_experiment(
         "summary": summary,
         "contestants": rows,
     }
+
+
+# ---------- Two-contestant comparison ----------
+
+COMPARE_KINDS = (
+    ("raw", "raw_avg", "raw_total"),
+    ("cal", "cal_avg", "cal_total"),
+    ("eff", "eff_avg", "eff_total"),
+)
+COMPARE_KIND_LABELS = {
+    "raw": "原始",
+    "cal": "校准",
+    "eff": "最终",
+}
+
+
+def _signed_leader(diff: float) -> str:
+    """Return "a" / "b" / "tie" for a strictly positive / negative / tied gap."""
+    if diff > TIE_EPS:
+        return "a"
+    if diff < -TIE_EPS:
+        return "b"
+    return "tie"
+
+
+def compare_contestants(
+    analysis: Mapping[str, Any], name_a: str, name_b: str
+) -> dict[str, Any]:
+    """Build the read-only side-by-side comparison of two contestants.
+
+    Purely derived from an existing ``analyze()`` result — it never re-fits
+    calibration parameters and never stores anything, so the view always
+    follows the current calibration scope and human adjudications.
+
+    Items a contestant has no scores for are reported as ``None`` (无数据):
+    they produce no difference and never count as leading/tied; the totals
+    (which only ever sum items a contestant actually has scores for) are
+    compared separately as the overall raw / calibrated / final gap.
+    """
+    blocks = {b["contestant"]: b for b in analysis["contestants"]}
+    missing = [n for n in (name_a, name_b) if n not in blocks]
+    if missing:
+        raise LookupError(f"找不到选手：{', '.join(missing)}")
+    if name_a == name_b:
+        raise ValueError("请选择两名不同的选手进行对比。")
+
+    block_a, block_b = blocks[name_a], blocks[name_b]
+    items_a = {ib["item"]: ib for ib in block_a["items"]}
+    items_b = {ib["item"]: ib for ib in block_b["items"]}
+    all_items = [
+        it for it in analysis.get("items", ()) if it in items_a or it in items_b
+    ]
+
+    summary = {
+        kind: {"a_leads": 0, "b_leads": 0, "ties": 0, "no_data": 0}
+        for kind, _, _ in COMPARE_KINDS
+    }
+
+    item_rows: list[dict[str, Any]] = []
+    for item in all_items:
+        ib_a = items_a.get(item)
+        ib_b = items_b.get(item)
+        row: dict[str, Any] = {
+            "item": item,
+            "a_present": ib_a is not None,
+            "b_present": ib_b is not None,
+            "a_n_scores": len(ib_a["scores"]) if ib_a else 0,
+            "b_n_scores": len(ib_b["scores"]) if ib_b else 0,
+        }
+        for kind, avg_key, _ in COMPARE_KINDS:
+            va = ib_a[avg_key] if ib_a else None
+            vb = ib_b[avg_key] if ib_b else None
+            if va is None or vb is None:
+                diff = None
+                leader = "none"
+                summary[kind]["no_data"] += 1
+            else:
+                diff = va - vb
+                leader = _signed_leader(diff)
+                if leader == "a":
+                    summary[kind]["a_leads"] += 1
+                elif leader == "b":
+                    summary[kind]["b_leads"] += 1
+                else:
+                    summary[kind]["ties"] += 1
+            row[f"a_{kind}"] = va
+            row[f"b_{kind}"] = vb
+            row[f"{kind}_diff"] = diff
+            row[f"{kind}_leader"] = leader
+        item_rows.append(row)
+
+    totals: dict[str, Any] = {}
+    for kind, _, total_key in COMPARE_KINDS:
+        ta = block_a[total_key]
+        tb = block_b[total_key]
+        diff = ta - tb
+        totals[kind] = {
+            "a": ta,
+            "b": tb,
+            "diff": diff,
+            "leader": _signed_leader(diff),
+            "a_rank": block_a[f"{kind}_rank"],
+            "b_rank": block_b[f"{kind}_rank"],
+        }
+
+    return {
+        "scope": analysis["scope"],
+        "scope_label": analysis["scope_label"],
+        "a": {
+            "contestant": name_a,
+            "item_count": block_a["item_count"],
+            "raw_overrides": block_a["raw_overrides"],
+        },
+        "b": {
+            "contestant": name_b,
+            "item_count": block_b["item_count"],
+            "raw_overrides": block_b["raw_overrides"],
+        },
+        "totals": totals,
+        "items": item_rows,
+        "summary": summary,
+        "kind_labels": COMPARE_KIND_LABELS,
+    }

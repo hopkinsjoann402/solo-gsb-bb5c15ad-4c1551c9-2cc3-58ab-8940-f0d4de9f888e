@@ -290,6 +290,160 @@ class TestAPI(unittest.TestCase):
         )
         self.assertEqual(r3.status_code, 404)
 
+    def test_16b_compare_full_data(self):
+        # Runs after test_15 loaded the sample fixture and before test_17 clears.
+        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
+        names = [b["contestant"] for b in analysis["contestants"]]
+        a_name, b_name = names[0], names[1]
+        r = client.post(
+            f"/api/sessions/{SID}/compare",
+            json={"contestant_a": a_name, "contestant_b": b_name},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["scope"], analysis["scope"])
+        self.assertEqual(data["a"]["contestant"], a_name)
+        self.assertEqual(data["b"]["contestant"], b_name)
+
+        blocks = {b["contestant"]: b for b in analysis["contestants"]}
+        # The sample scores every contestant on every item.
+        n_items = analysis["counts"]["items"]
+        self.assertEqual(len(data["items"]), n_items)
+        for kind in ("raw", "cal", "eff"):
+            t = data["totals"][kind]
+            self.assertAlmostEqual(t["a"], blocks[a_name][f"{kind}_total"])
+            self.assertAlmostEqual(t["b"], blocks[b_name][f"{kind}_total"])
+            self.assertAlmostEqual(t["diff"], t["a"] - t["b"])
+            self.assertEqual(t["a_rank"], blocks[a_name][f"{kind}_rank"])
+            self.assertIn(t["leader"], ("a", "b", "tie"))
+            st = data["summary"][kind]
+            self.assertEqual(
+                st["a_leads"] + st["b_leads"] + st["ties"] + st["no_data"], n_items
+            )
+            # No missing items in the balanced sample.
+            self.assertEqual(st["no_data"], 0)
+        for row in data["items"]:
+            self.assertTrue(row["a_present"] and row["b_present"])
+            self.assertIsNotNone(row["raw_diff"])
+
+        # Endpoint is read-only: nothing about the session changed.
+        again = client.get(f"/api/sessions/{SID}/analysis").json()
+        self.assertEqual(again["counts"]["scores"], analysis["counts"]["scores"])
+        self.assertEqual(again["counts"]["decisions"], analysis["counts"]["decisions"])
+
+        # Reversed selection flips the sign and the leader.
+        rev = client.post(
+            f"/api/sessions/{SID}/compare",
+            json={"contestant_a": b_name, "contestant_b": a_name},
+        ).json()
+        self.assertAlmostEqual(
+            rev["totals"]["raw"]["diff"], -data["totals"]["raw"]["diff"]
+        )
+
+    def test_16c_compare_missing_item(self):
+        # C2 has no score for item P2 -> 无数据, not a zero in the gap/stats.
+        body = (
+            "选手,评委,项目,分数\n"
+            "C1,JA,P1,8.0\nC2,JA,P1,7.0\nC1,JB,P1,9.0\nC2,JB,P1,6.0\n"
+            "C1,JA,P2,9.0\nC1,JB,P2,8.0\n"
+        )
+        client.post(
+            f"/api/sessions/{SID}/upload?scope=judge",
+            files={"file": ("m.csv", body.encode("utf-8"), "text/csv")},
+        )
+        r = client.post(
+            f"/api/sessions/{SID}/compare",
+            json={"contestant_a": "C1", "contestant_b": "C2"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        by_item = {row["item"]: row for row in data["items"]}
+        self.assertEqual(set(by_item), {"P1", "P2"})
+        p2 = by_item["P2"]
+        self.assertTrue(p2["a_present"])
+        self.assertFalse(p2["b_present"])
+        for kind in ("raw", "cal", "eff"):
+            self.assertIsNone(p2[f"b_{kind}"])
+            self.assertIsNone(p2[f"{kind}_diff"])
+            self.assertEqual(p2[f"{kind}_leader"], "none")
+            self.assertEqual(
+                (data["summary"][kind]["a_leads"], data["summary"][kind]["no_data"]),
+                (1, 1),
+            )
+        # B's total still sums only P1 (not a zero for P2).
+        self.assertAlmostEqual(data["totals"]["raw"]["b"], 6.5)
+
+    def test_16d_compare_refreshes_with_scope_and_decisions(self):
+        # Switch scope -> comparison follows the new scope without re-selecting.
+        client.post(f"/api/sessions/{SID}/scope", json={"scope": "judge_item"})
+        r = client.post(
+            f"/api/sessions/{SID}/compare",
+            json={"contestant_a": "C1", "contestant_b": "C2"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["scope"], "judge_item")
+        before = r.json()
+
+        # Adjudication on one of C1's scores (id taken from fresh data).
+        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
+        score_id = next(
+            s["id"] for b in analysis["contestants"]
+            if b["contestant"] == "C1"
+            for ib in b["items"] for s in ib["scores"]
+        )
+        client.patch(
+            f"/api/sessions/{SID}/scores/{score_id}/decision",
+            json={"use_raw": True, "reason": "复核"},
+        )
+        after = client.post(
+            f"/api/sessions/{SID}/compare",
+            json={"contestant_a": "C1", "contestant_b": "C2"},
+        ).json()
+        # Raw/cal columns are never touched by decisions...
+        for kind in ("raw", "cal"):
+            self.assertAlmostEqual(
+                after["totals"][kind]["diff"], before["totals"][kind]["diff"]
+            )
+        # ...while effective figures match the freshly re-adjudicated analysis.
+        blocks = {b["contestant"]: b for b in analysis["contestants"]}  # stale snapshot
+        fresh = client.get(f"/api/sessions/{SID}/analysis").json()
+        fblocks = {b["contestant"]: b for b in fresh["contestants"]}
+        self.assertAlmostEqual(after["totals"]["eff"]["a"], fblocks["C1"]["eff_total"])
+        self.assertAlmostEqual(after["totals"]["eff"]["b"], fblocks["C2"]["eff_total"])
+        self.assertEqual(fresh["counts"]["decisions"], 1)
+        self.assertNotEqual(
+            fblocks["C1"]["eff_total"], blocks["C1"]["eff_total"]
+        )
+        client.post(f"/api/sessions/{SID}/scope", json={"scope": "judge"})
+
+    def test_16e_compare_errors(self):
+        # Unknown contestant -> 400.
+        r = client.post(
+            f"/api/sessions/{SID}/compare",
+            json={"contestant_a": "C1", "contestant_b": "不存在"},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("选手", r.json()["detail"])
+        # Same contestant twice -> 400.
+        r2 = client.post(
+            f"/api/sessions/{SID}/compare",
+            json={"contestant_a": "C1", "contestant_b": "C1"},
+        )
+        self.assertEqual(r2.status_code, 400)
+        # Unknown session -> 404.
+        r3 = client.post(
+            "/api/sessions/nope/compare",
+            json={"contestant_a": "C1", "contestant_b": "C2"},
+        )
+        self.assertEqual(r3.status_code, 404)
+        # Empty session -> 400.
+        client.delete(f"/api/sessions/{SID}")
+        r4 = client.post(
+            f"/api/sessions/{SID}/compare",
+            json={"contestant_a": "C1", "contestant_b": "C2"},
+        )
+        self.assertEqual(r4.status_code, 400)
+
     def test_17_clear(self):
         r = client.delete(f"/api/sessions/{SID}")
         self.assertEqual(r.status_code, 200)
