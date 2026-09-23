@@ -16,6 +16,8 @@ document.getElementById("session-id").textContent = SESSION_ID;
 // ---------- State ----------
 let analysis = null;
 let stability = null; // 排名稳定性实验结果（纯前端临时态，不持久化）
+let compareData = null; // 双选手对比结果（只读，不落库，每次由当前评分实时计算）
+let compareReqId = 0; // 丢弃过期的对比响应
 let ruleDraft = null; // 规则编辑器草稿（数组），DOM 是输入中的真实来源
 let rulePreviewData = null; // 最近一次规则预览结果（只读，不落库）
 let rulePreviewStale = false; // 草稿在预览后又被修改
@@ -66,6 +68,8 @@ function render() {
   if (!analysis || analysis.counts.scores === 0) {
     dashboard.hidden = true;
     emptyState.hidden = false;
+    compareReqId += 1;
+    compareData = null;
     return;
   }
   emptyState.hidden = true;
@@ -91,6 +95,7 @@ function render() {
   initRuleDraft();
   renderDetails();
   renderStability();
+  refreshCompare();
 }
 
 // ---------- Ranking stability experiment ----------
@@ -197,6 +202,175 @@ function renderStability() {
     </div>
     <div class="table-wrap stability-table-wrap"><table>${head}${rows}</table></div>`;
 }
+
+// ---------- Head-to-head comparison ----------
+const compareASel = $("#compare-a");
+const compareBSel = $("#compare-b");
+
+function setCompareMsg(text, cls = "") {
+  const el = $("#compare-msg");
+  el.textContent = text;
+  el.className = "msg " + cls;
+}
+
+function fillCompareSelect(sel, prevVal) {
+  const blocks = analysis && analysis.counts.scores > 0 ? analysis.contestants : [];
+  sel.innerHTML =
+    `<option value="" disabled${prevVal ? "" : " selected"}>请选择选手…</option>` +
+    blocks
+      .map((b) => `<option value="${esc(b.contestant)}">#${b.eff_rank} ${esc(b.contestant)}</option>`)
+      .join("");
+  if (blocks.some((b) => b.contestant === prevVal)) sel.value = prevVal;
+}
+
+function syncCompareControls() {
+  const hasData = !!(analysis && analysis.counts.scores > 0);
+  fillCompareSelect(compareASel, compareASel.value);
+  fillCompareSelect(compareBSel, compareBSel.value);
+  compareASel.disabled = !hasData;
+  compareBSel.disabled = !hasData;
+}
+
+// Recompute the comparison whenever the underlying analysis changes
+// (scope switch, decisions, re-upload) — nothing is stored client-side.
+function refreshCompare() {
+  syncCompareControls();
+  const a = compareASel.value;
+  const b = compareBSel.value;
+  if (!analysis || analysis.counts.scores === 0 || !a || !b || a === b) {
+    compareReqId += 1; // invalidate any in-flight response
+    compareData = null;
+    renderCompare();
+    return;
+  }
+  if (compareData && (compareData.a !== a || compareData.b !== b)) {
+    compareData = null; // selection changed; drop the stale pair immediately
+    renderCompare();
+  }
+  const myId = ++compareReqId;
+  setCompareMsg("对比计算中…");
+  api(`/api/sessions/${SESSION_ID}/compare?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`)
+    .then((data) => {
+      if (myId !== compareReqId) return; // a newer request superseded this one
+      compareData = data;
+      setCompareMsg("");
+      renderCompare();
+    })
+    .catch((err) => {
+      if (myId !== compareReqId) return;
+      compareData = null;
+      setCompareMsg(err.message, "error");
+      renderCompare();
+    });
+}
+
+function renderCompare() {
+  const panel = $("#compare-result");
+  const a = compareASel.value;
+  const b = compareBSel.value;
+  if (!compareData) {
+    if (a && b && a === b) {
+      panel.innerHTML = `<p class="hint">选手 A 与选手 B 相同，请选择两名不同的选手。</p>`;
+    } else if (a || b) {
+      panel.innerHTML = `<p class="hint">再选择一名选手即可开始对比。</p>`;
+    } else {
+      panel.innerHTML = "";
+    }
+    return;
+  }
+
+  const t = compareData.totals;
+  const ranks = compareData.ranks;
+  const s = compareData.summary;
+
+  const rankDiff = ranks.b.eff - ranks.a.eff; // >0: A 名次更靠前
+  const rankCell =
+    rankDiff > 0
+      ? `<span class="delta-up">${esc(compareData.a)} 领先 ${rankDiff} 名</span>`
+      : rankDiff < 0
+        ? `<span class="delta-down">${esc(compareData.b)} 领先 ${-rankDiff} 名</span>`
+        : `<span class="delta-flat">并列</span>`;
+
+  const totalsRows = [
+    ["原始总分", t.a.raw, t.b.raw, t.delta.raw, false],
+    ["校准总分", t.a.cal, t.b.cal, t.delta.cal, false],
+    ["最终总分", t.a.eff, t.b.eff, t.delta.eff, true],
+  ]
+    .map(
+      ([label, va, vb, d, bold]) => `
+    <tr>
+      <td>${label}</td>
+      <td class="num">${bold ? `<b>${fmt(va)}</b>` : fmt(va)}</td>
+      <td class="num">${bold ? `<b>${fmt(vb)}</b>` : fmt(vb)}</td>
+      <td class="num">${totalDeltaHtml(d)}</td>
+    </tr>`,
+    )
+    .join("");
+
+  const totalsTable = `
+    <div class="table-wrap compare-totals-wrap"><table>
+      <tr><th></th><th class="num">${esc(compareData.a)}</th><th class="num">${esc(compareData.b)}</th><th class="num">差值 (A−B)</th></tr>
+      ${totalsRows}
+      <tr><td>最终名次</td><td class="num"><b>${ranks.a.eff}</b></td><td class="num"><b>${ranks.b.eff}</b></td><td class="num">${rankCell}</td></tr>
+    </table></div>`;
+
+  const eff = s.eff;
+  const statText = (k) => `${s[k].a_leads} / ${s[k].b_leads} / ${s[k].ties}`;
+  const missing = [];
+  if (s.a_only > 0) missing.push(`${s.a_only} 个项目仅 ${esc(compareData.a)} 有评分`);
+  if (s.b_only > 0) missing.push(`${s.b_only} 个项目仅 ${esc(compareData.b)} 有评分`);
+  const banner = `
+    <div class="compare-banner">
+      逐项目胜负（按最终分，共 <b>${s.compared}</b> 个可比项目）：
+      <b>${esc(compareData.a)}</b> 领先 <b class="delta-up">${eff.a_leads}</b> 项 ｜
+      <b>${esc(compareData.b)}</b> 领先 <b class="delta-down">${eff.b_leads}</b> 项 ｜
+      持平 <b>${eff.ties}</b> 项。
+      <span class="compare-note">（A胜 / B胜 / 持平）按原始分 ${statText("raw")}，按校准分 ${statText("cal")}。${missing.length ? missing.join("，") + "，已标为无数据、不计入差值与胜负统计。" : ""}</span>
+    </div>`;
+
+  const valCell = (snap, k, bold) =>
+    snap
+      ? `<td class="num">${bold ? `<b>${fmt(snap[k])}</b>` : fmt(snap[k])}</td>`
+      : `<td class="num nodata">无数据</td>`;
+  const deltaCell = (d, k) =>
+    d ? `<td class="num">${totalDeltaHtml(d[k])}</td>` : `<td class="num nodata">—</td>`;
+  const leadCell = (lead) => {
+    if (lead === "a") return `<td><span class="delta-up">${esc(compareData.a)}</span></td>`;
+    if (lead === "b") return `<td><span class="delta-down">${esc(compareData.b)}</span></td>`;
+    if (lead === "tie") return `<td><span class="delta-flat">持平</span></td>`;
+    return `<td><span class="delta-flat">—</span></td>`;
+  };
+
+  const head = `
+    <tr>
+      <th>项目</th>
+      <th class="num">${esc(compareData.a)}<br>原始</th><th class="num">${esc(compareData.b)}<br>原始</th><th class="num">原始差<br>(A−B)</th>
+      <th class="num">${esc(compareData.a)}<br>校准</th><th class="num">${esc(compareData.b)}<br>校准</th><th class="num">校准差<br>(A−B)</th>
+      <th class="num">${esc(compareData.a)}<br>最终</th><th class="num">${esc(compareData.b)}<br>最终</th><th class="num">最终差<br>(A−B)</th>
+      <th>领先<br>(最终)</th>
+    </tr>`;
+  const rows = compareData.items
+    .map(
+      (r) => `
+    <tr>
+      <td>${esc(r.item)}</td>
+      ${valCell(r.a, "raw")}${valCell(r.b, "raw")}${deltaCell(r.delta, "raw")}
+      ${valCell(r.a, "cal")}${valCell(r.b, "cal")}${deltaCell(r.delta, "cal")}
+      ${valCell(r.a, "eff", true)}${valCell(r.b, "eff", true)}${deltaCell(r.delta, "eff")}
+      ${leadCell(r.lead)}
+    </tr>`,
+    )
+    .join("");
+
+  panel.innerHTML =
+    banner +
+    totalsTable +
+    `<h3 class="sub">逐项目对比（项目内各评委打分的均值）</h3>` +
+    `<div class="table-wrap compare-table-wrap"><table>${head}${rows}</table></div>`;
+}
+
+compareASel.addEventListener("change", refreshCompare);
+compareBSel.addEventListener("change", refreshCompare);
 
 function renderGroups() {
   const byItem = analysis.scope === "judge_item";

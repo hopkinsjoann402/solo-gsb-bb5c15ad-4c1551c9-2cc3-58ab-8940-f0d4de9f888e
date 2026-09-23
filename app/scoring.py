@@ -253,6 +253,109 @@ def analyze(
     }
 
 
+def compare_contestants(
+    analysis: Mapping[str, Any],
+    name_a: str,
+    name_b: str,
+) -> dict[str, Any]:
+    """Head-to-head comparison of two contestants from a finished analysis.
+
+    Pure read-only transform: totals and per-item judge averages are reused
+    from ``analysis`` as-is, so the result always matches the current
+    calibration scope and any manual decisions — nothing is recomputed or
+    persisted. Items a contestant was never scored in are reported as
+    ``None`` (无数据) and excluded from every delta and from lead/tie
+    counts; they are never treated as zero.
+    """
+    if name_a == name_b:
+        raise ValueError("请选择两名不同的选手进行对比。")
+    blocks = {b["contestant"]: b for b in analysis["contestants"]}
+    unknown = [n for n in (name_a, name_b) if n not in blocks]
+    if unknown:
+        raise LookupError("选手不存在: " + "、".join(unknown))
+    block_a, block_b = blocks[name_a], blocks[name_b]
+    map_a = {ib["item"]: ib for ib in block_a["items"]}
+    map_b = {ib["item"]: ib for ib in block_b["items"]}
+
+    def snapshot(ib: Mapping[str, Any] | None) -> dict[str, float] | None:
+        if ib is None:
+            return None
+        return {"raw": ib["raw_avg"], "cal": ib["cal_avg"], "eff": ib["eff_avg"]}
+
+    kinds = ("raw", "cal", "eff")
+    rows: list[dict[str, Any]] = []
+    lead_counts = {k: {"a_leads": 0, "b_leads": 0, "ties": 0} for k in kinds}
+    compared = a_only = b_only = 0
+    for item in analysis["items"]:
+        snap_a = snapshot(map_a.get(item))
+        snap_b = snapshot(map_b.get(item))
+        delta: dict[str, float] | None = None
+        lead: str | None = None
+        if snap_a is not None and snap_b is not None:
+            compared += 1
+            delta = {k: snap_a[k] - snap_b[k] for k in kinds}
+            for k in kinds:
+                if delta[k] > TIE_EPS:
+                    lead_counts[k]["a_leads"] += 1
+                elif delta[k] < -TIE_EPS:
+                    lead_counts[k]["b_leads"] += 1
+                else:
+                    lead_counts[k]["ties"] += 1
+            d = delta["eff"]
+            lead = "a" if d > TIE_EPS else ("b" if d < -TIE_EPS else "tie")
+        elif snap_a is not None:
+            a_only += 1
+        elif snap_b is not None:
+            b_only += 1
+        rows.append(
+            {"item": item, "a": snap_a, "b": snap_b, "delta": delta, "lead": lead}
+        )
+
+    totals_a = {
+        "raw": block_a["raw_total"],
+        "cal": block_a["cal_total"],
+        "eff": block_a["eff_total"],
+    }
+    totals_b = {
+        "raw": block_b["raw_total"],
+        "cal": block_b["cal_total"],
+        "eff": block_b["eff_total"],
+    }
+    return {
+        "scope": analysis["scope"],
+        "scope_label": analysis["scope_label"],
+        "a": name_a,
+        "b": name_b,
+        "totals": {
+            "a": totals_a,
+            "b": totals_b,
+            "delta": {k: totals_a[k] - totals_b[k] for k in kinds},
+        },
+        "ranks": {
+            "a": {
+                "raw": block_a["raw_rank"],
+                "cal": block_a["cal_rank"],
+                "eff": block_a["eff_rank"],
+            },
+            "b": {
+                "raw": block_b["raw_rank"],
+                "cal": block_b["cal_rank"],
+                "eff": block_b["eff_rank"],
+            },
+        },
+        "items": rows,
+        "summary": {
+            "items_total": len(analysis["items"]),
+            "compared": compared,
+            "a_only": a_only,
+            "b_only": b_only,
+            "raw": lead_counts["raw"],
+            "cal": lead_counts["cal"],
+            "eff": lead_counts["eff"],
+        },
+    }
+
+
 EXCLUDE_JUDGE = "judge"
 EXCLUDE_ITEM = "item"
 EXCLUDE_TYPES = (EXCLUDE_JUDGE, EXCLUDE_ITEM)

@@ -65,9 +65,26 @@
       <div id="rank-table-wrap" class="table-wrap"></div>
     </section>
 
-    <!-- 4. 评分裁决规则批处理 -->
+    <!-- 4. 双选手对比 -->
     <section class="card">
-      <h2>④ 评分裁决规则批处理</h2>
+      <h2>④ 双选手对比</h2>
+      <p class="hint">
+        从当前数据中选择两名选手，对比<b>原始、校准与最终总分差</b>（A−B）及最终名次，并按项目列出双方得分与差值。
+        逐项目按<b>最终分</b>汇总领先与持平（同时附按原始分、校准分的统计）；某选手在某项目无评分时标为<b>「无数据」</b>，
+        不按零分参与差值或胜负统计。对比由当前评分实时计算，随校准范围或人工裁决变化自动刷新，<b>不另存评分</b>。
+      </p>
+      <div class="toolbar compare-controls">
+        <label>选手 A <select id="compare-a" class="select"></select></label>
+        <span class="compare-vs">VS</span>
+        <label>选手 B <select id="compare-b" class="select"></select></label>
+        <span id="compare-msg" class="msg"></span>
+      </div>
+      <div id="compare-result" class="compare-result"></div>
+    </section>
+
+    <!-- 5. 评分裁决规则批处理 -->
+    <section class="card">
+      <h2>⑤ 评分裁决规则批处理</h2>
       <p class="hint">
         按<b>评委、项目、原始分区间、校准分区间</b>组合条件（留空表示不限），批量指定「保留原分 / 采用校准分」与理由模板，
         并为每条规则指定<b>优先级</b>（数字越小越优先，数字相同按规则顺序前者优先）。
@@ -87,9 +104,9 @@
       <div id="rules-preview" class="rules-preview"></div>
     </section>
 
-    <!-- 5. 排名稳定性实验 -->
+    <!-- 6. 排名稳定性实验 -->
     <section class="card">
-      <h2>⑤ 排名稳定性实验（临时模拟，不保存）</h2>
+      <h2>⑥ 排名稳定性实验（临时模拟，不保存）</h2>
       <p class="hint">
         选择<b>临时排除一名评委或一个项目</b>，系统按当前校准范围重算原始分、校准分、最终总分与竞赛名次，
         并逐位展示每位选手相对基线的名次/总分变化及被移除的评分条数。
@@ -108,9 +125,9 @@
       <div id="stability-result" class="stability-result"></div>
     </section>
 
-    <!-- 6. 逐项裁决 -->
+    <!-- 7. 逐项裁决 -->
     <section class="card">
-      <h2>⑥ 逐项评分裁决</h2>
+      <h2>⑦ 逐项评分裁决</h2>
       <p class="hint">对每条原始评分选择「采用校准分」或「保留原分」并填写理由，排名将实时重算。</p>
       <div id="detail-panel"></div>
     </section>

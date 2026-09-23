@@ -18,7 +18,13 @@ from .rules import (
     normalize_rules,
     score_rows_from_analysis,
 )
-from .scoring import SCOPES, SCOPE_JUDGE, analyze, stability_experiment
+from .scoring import (
+    SCOPES,
+    SCOPE_JUDGE,
+    analyze,
+    compare_contestants,
+    stability_experiment,
+)
 
 SAMPLE_PATH = os.environ.get(
     "CALIB_SAMPLE_PATH",
@@ -289,6 +295,27 @@ def stability_check(session_id: str, body: StabilityBody) -> dict[str, Any]:
             records, decisions, scope, body.exclude_type, body.exclude_name.strip()
         )
     except LookupError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/sessions/{session_id}/compare")
+def compare_two_contestants(session_id: str, a: str, b: str) -> dict[str, Any]:
+    """Read-only head-to-head comparison, recomputed from current data.
+
+    The comparison is derived from the same analysis pipeline on every call,
+    so it always reflects the current calibration scope and manual
+    decisions. Nothing is persisted and no scores are duplicated.
+    """
+    with db.get_conn() as conn:
+        if db.get_scope(conn, session_id) is None:
+            raise HTTPException(status_code=404, detail="会话不存在，请先上传数据。")
+        scope = _resolve_scope(conn, session_id, None)
+        analysis = _build_analysis(conn, session_id, scope)
+    if analysis["counts"]["scores"] == 0:
+        raise HTTPException(status_code=404, detail="当前会话没有评分数据，无法对比。")
+    try:
+        return compare_contestants(analysis, a, b)
+    except (LookupError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
 

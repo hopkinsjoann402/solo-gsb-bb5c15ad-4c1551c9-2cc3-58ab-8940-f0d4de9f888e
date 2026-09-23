@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.scoring import (
     MAD_K,
     analyze,
+    compare_contestants,
     competition_rank,
     robust_params,
     stability_experiment,
@@ -139,6 +140,142 @@ class TestCalibration(unittest.TestCase):
     def test_bad_scope(self):
         with self.assertRaises(ValueError):
             analyze(recs(self.data), {}, "bogus")
+
+
+class TestCompareContestants(unittest.TestCase):
+    def setUp(self):
+        # C1: I1+I2; C2: I1+I2; C3: only I1 (missing I2 -> 无数据).
+        data = [
+            ("C1", "JA", "I1", 8.0), ("C2", "JA", "I1", 7.0), ("C3", "JA", "I1", 9.0),
+            ("C1", "JB", "I1", 8.0), ("C2", "JB", "I1", 7.0), ("C3", "JB", "I1", 9.0),
+            ("C1", "JA", "I2", 6.0), ("C2", "JA", "I2", 8.0),
+            ("C1", "JB", "I2", 6.0), ("C2", "JB", "I2", 8.0),
+        ]
+        self.records = recs(data)
+
+    def test_total_and_item_deltas(self):
+        a = analyze(self.records, {}, "judge")
+        cmp_ = compare_contestants(a, "C1", "C2")
+        blocks = {b["contestant"]: b for b in a["contestants"]}
+        for kind in ("raw", "cal", "eff"):
+            key = f"{kind}_total"
+            self.assertAlmostEqual(
+                cmp_["totals"]["delta"][kind],
+                blocks["C1"][key] - blocks["C2"][key],
+            )
+        # Every known item appears in output order, with per-judge-average deltas.
+        self.assertEqual([r["item"] for r in cmp_["items"]], a["items"])
+        i1 = next(r for r in cmp_["items"] if r["item"] == "I1")
+        self.assertAlmostEqual(i1["delta"]["raw"], 1.0)  # 8.0 vs 7.0
+        self.assertEqual(i1["lead"], "a")
+        i2 = next(r for r in cmp_["items"] if r["item"] == "I2")
+        self.assertAlmostEqual(i2["delta"]["raw"], -2.0)  # 6.0 vs 8.0
+        self.assertEqual(i2["lead"], "b")
+        # Ranks are echoed for both sides.
+        self.assertEqual(cmp_["ranks"]["a"]["eff"], blocks["C1"]["eff_rank"])
+        self.assertEqual(cmp_["ranks"]["b"]["eff"], blocks["C2"]["eff_rank"])
+
+    def test_lead_tie_counts(self):
+        a = analyze(self.records, {}, "judge")
+        cmp_ = compare_contestants(a, "C1", "C2")
+        self.assertEqual(cmp_["summary"]["compared"], 2)
+        self.assertEqual(cmp_["summary"]["a_only"], 0)
+        self.assertEqual(cmp_["summary"]["b_only"], 0)
+        for kind in ("raw", "cal", "eff"):
+            c = cmp_["summary"][kind]
+            self.assertEqual(c["a_leads"] + c["b_leads"] + c["ties"], 2)
+        # Symmetric swap flips leads and the sign of every delta.
+        swapped = compare_contestants(a, "C2", "C1")
+        self.assertAlmostEqual(
+            swapped["totals"]["delta"]["eff"], -cmp_["totals"]["delta"]["eff"]
+        )
+        self.assertEqual(swapped["summary"]["eff"]["a_leads"], cmp_["summary"]["eff"]["b_leads"])
+
+    def test_missing_item_is_no_data_not_zero(self):
+        a = analyze(self.records, {}, "judge")
+        cmp_ = compare_contestants(a, "C1", "C3")
+        i2 = next(r for r in cmp_["items"] if r["item"] == "I2")
+        self.assertIsNone(i2["b"])
+        self.assertIsNotNone(i2["a"])
+        self.assertIsNone(i2["delta"])
+        self.assertIsNone(i2["lead"])
+        # I1 is the only comparable item; I2 is one-side-only.
+        self.assertEqual(cmp_["summary"]["compared"], 1)
+        self.assertEqual(cmp_["summary"]["a_only"], 1)
+        self.assertEqual(cmp_["summary"]["b_only"], 0)
+        eff = cmp_["summary"]["eff"]
+        self.assertEqual(eff["a_leads"] + eff["b_leads"] + eff["ties"], 1)
+
+    def test_item_missing_for_both_sides(self):
+        # Add an item neither C1 nor C2 ever scored.
+        data = [
+            ("C1", "JA", "I1", 8.0), ("C2", "JA", "I1", 7.0),
+            ("C1", "JB", "I1", 8.0), ("C2", "JB", "I1", 7.0),
+            ("C3", "JA", "I3", 9.0), ("C3", "JB", "I3", 9.0),
+        ]
+        a = analyze(recs(data), {}, "judge")
+        cmp_ = compare_contestants(a, "C1", "C2")
+        self.assertEqual(cmp_["summary"]["items_total"], 2)
+        self.assertEqual(cmp_["summary"]["compared"], 1)
+        i3 = next(r for r in cmp_["items"] if r["item"] == "I3")
+        self.assertIsNone(i3["a"])
+        self.assertIsNone(i3["b"])
+        self.assertIsNone(i3["delta"])
+
+    def test_exact_tie(self):
+        data = [
+            ("C1", "JA", "I1", 8.0), ("C2", "JA", "I1", 8.0),
+            ("C1", "JB", "I1", 7.0), ("C2", "JB", "I1", 7.0),
+        ]
+        a = analyze(recs(data), {}, "judge")
+        cmp_ = compare_contestants(a, "C1", "C2")
+        self.assertEqual(cmp_["items"][0]["lead"], "tie")
+        self.assertEqual(cmp_["summary"]["eff"]["ties"], 1)
+        self.assertEqual(cmp_["summary"]["eff"]["a_leads"], 0)
+        self.assertEqual(cmp_["totals"]["delta"]["eff"], 0)
+
+    def test_decisions_change_eff_only(self):
+        # Three-judge reversal fixture: JC is a wild outlier, so calibrated
+        # scores are guaranteed to differ from raw ones.
+        records = recs([
+            ("C1", "JA", "I1", 8.30), ("C2", "JA", "I1", 8.00),
+            ("C3", "JA", "I1", 7.90), ("C4", "JA", "I1", 7.80),
+            ("C1", "JB", "I1", 8.30), ("C2", "JB", "I1", 8.00),
+            ("C3", "JB", "I1", 7.85), ("C4", "JB", "I1", 7.75),
+            ("C1", "JC", "I1", 5.0), ("C2", "JC", "I1", 9.5),
+            ("C3", "JC", "I1", 7.2), ("C4", "JC", "I1", 6.8),
+        ])
+        a0 = analyze(records, {}, "judge")
+        before = compare_contestants(a0, "C1", "C3")
+        # Pick one of C3's scores whose calibrated value actually moves.
+        target = next(
+            s
+            for blk in a0["contestants"]
+            if blk["contestant"] == "C3"
+            for ib in blk["items"]
+            for s in ib["scores"]
+            if abs(s["calibrated"] - s["raw"]) > 1e-9
+        )
+        a1 = analyze(records, {target["id"]: (True, "复核")}, "judge")
+        after = compare_contestants(a1, "C1", "C3")
+        self.assertAlmostEqual(
+            after["totals"]["delta"]["raw"], before["totals"]["delta"]["raw"]
+        )
+        self.assertAlmostEqual(
+            after["totals"]["delta"]["cal"], before["totals"]["delta"]["cal"]
+        )
+        self.assertNotAlmostEqual(
+            after["totals"]["delta"]["eff"], before["totals"]["delta"]["eff"]
+        )
+
+    def test_errors(self):
+        a = analyze(self.records, {}, "judge")
+        with self.assertRaises(ValueError):
+            compare_contestants(a, "C1", "C1")
+        with self.assertRaises(LookupError):
+            compare_contestants(a, "C1", "NOBODY")
+        with self.assertRaises(LookupError):
+            compare_contestants(a, "NOBODY", "C1")
 
 
 class TestStabilityExperiment(unittest.TestCase):

@@ -308,5 +308,123 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(r3.status_code, 404)
 
 
+    def test_18_compare_endpoint(self):
+        # Session was cleared in test_17; reload the sample fixture.
+        client.post(f"/api/sessions/{SID}/sample?scope=judge")
+        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
+        names = [b["contestant"] for b in analysis["contestants"]]
+        a, b = names[0], names[1]
+        r = client.get(f"/api/sessions/{SID}/compare", params={"a": a, "b": b})
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["a"], a)
+        self.assertEqual(data["b"], b)
+        self.assertEqual(data["scope"], "judge")
+        self.assertEqual(len(data["items"]), analysis["counts"]["items"])
+        # Total deltas are consistent with the analysis blocks.
+        blocks = {blk["contestant"]: blk for blk in analysis["contestants"]}
+        for kind in ("raw", "cal", "eff"):
+            self.assertAlmostEqual(
+                data["totals"]["delta"][kind],
+                blocks[a][f"{kind}_total"] - blocks[b][f"{kind}_total"],
+            )
+        # Summary counts add up; sample data has no missing items.
+        s = data["summary"]
+        self.assertEqual(
+            s["compared"] + s["a_only"] + s["b_only"], analysis["counts"]["items"]
+        )
+        self.assertEqual(s["a_only"], 0)
+        self.assertEqual(s["b_only"], 0)
+        for kind in ("raw", "cal", "eff"):
+            c = s[kind]
+            self.assertEqual(c["a_leads"] + c["b_leads"] + c["ties"], s["compared"])
+
+    def test_19_compare_reflects_decision_and_scope(self):
+        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
+        names = [b["contestant"] for b in analysis["contestants"]]
+        a, b = names[0], names[1]
+        before = client.get(f"/api/sessions/{SID}/compare", params={"a": a, "b": b}).json()
+        # Flip one of A's scores whose calibrated value differs from raw.
+        target = next(
+            s
+            for blk in analysis["contestants"]
+            if blk["contestant"] == a
+            for ib in blk["items"]
+            for s in ib["scores"]
+            if abs(s["calibrated"] - s["raw"]) > 1e-9
+        )
+        client.patch(
+            f"/api/sessions/{SID}/scores/{target['id']}/decision",
+            json={"use_raw": True, "reason": "对比测试"},
+        )
+        after = client.get(f"/api/sessions/{SID}/compare", params={"a": a, "b": b}).json()
+        self.assertNotAlmostEqual(
+            after["totals"]["delta"]["eff"], before["totals"]["delta"]["eff"]
+        )
+        self.assertAlmostEqual(
+            after["totals"]["delta"]["raw"], before["totals"]["delta"]["raw"]
+        )
+        self.assertAlmostEqual(
+            after["totals"]["delta"]["cal"], before["totals"]["delta"]["cal"]
+        )
+        # Scope switch recomputes calibrated values in the comparison too.
+        client.post(f"/api/sessions/{SID}/scope", json={"scope": "judge_item"})
+        scoped = client.get(f"/api/sessions/{SID}/compare", params={"a": a, "b": b}).json()
+        self.assertEqual(scoped["scope"], "judge_item")
+        self.assertNotAlmostEqual(
+            scoped["totals"]["delta"]["cal"], after["totals"]["delta"]["cal"]
+        )
+        # Restore baseline state for later tests.
+        client.post(f"/api/sessions/{SID}/scope", json={"scope": "judge"})
+        client.post(f"/api/sessions/{SID}/decisions/reset")
+
+    def test_20_compare_errors_and_readonly(self):
+        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
+        names = [b["contestant"] for b in analysis["contestants"]]
+        # Same contestant on both sides -> 400.
+        r = client.get(
+            f"/api/sessions/{SID}/compare", params={"a": names[0], "b": names[0]}
+        )
+        self.assertEqual(r.status_code, 400)
+        # Unknown contestant -> 400.
+        r2 = client.get(
+            f"/api/sessions/{SID}/compare", params={"a": names[0], "b": "查无此人"}
+        )
+        self.assertEqual(r2.status_code, 400)
+        self.assertIn("查无此人", r2.json()["detail"])
+        # Unknown session -> 404.
+        r3 = client.get("/api/sessions/nope/compare", params={"a": "x", "b": "y"})
+        self.assertEqual(r3.status_code, 404)
+        # Read-only: no decisions were created by any of the comparisons.
+        again = client.get(f"/api/sessions/{SID}/analysis").json()
+        self.assertEqual(again["counts"]["decisions"], 0)
+
+    def test_21_compare_missing_item_is_no_data(self):
+        csv_body = (
+            "选手,评委,项目,分数\n"
+            "A,J1,I1,8\nA,J2,I1,9\nB,J1,I1,7\nB,J2,I1,6\n"
+            "A,J1,I2,8\nA,J2,I2,8\n"  # B 在 I2 无评分
+        )
+        r = client.post(
+            f"/api/sessions/{SID}/upload?scope=judge",
+            files={"file": ("m.csv", csv_body.encode("utf-8-sig"), "text/csv")},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        data = client.get(f"/api/sessions/{SID}/compare", params={"a": "A", "b": "B"}).json()
+        i2 = next(row for row in data["items"] if row["item"] == "I2")
+        self.assertIsNotNone(i2["a"])
+        self.assertIsNone(i2["b"])
+        self.assertIsNone(i2["delta"])
+        self.assertIsNone(i2["lead"])
+        s = data["summary"]
+        self.assertEqual(s["compared"], 1)
+        self.assertEqual(s["a_only"], 1)
+        self.assertEqual(s["b_only"], 0)
+        # Only the shared item participates in lead/tie counts.
+        for kind in ("raw", "cal", "eff"):
+            c = s[kind]
+            self.assertEqual(c["a_leads"] + c["b_leads"] + c["ties"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
