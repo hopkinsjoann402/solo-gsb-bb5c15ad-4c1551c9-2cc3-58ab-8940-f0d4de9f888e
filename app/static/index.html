@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多评委评分校准</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>多评委评分校准</h1>
+  <div class="session-info">
+    <span>会话：<code id="session-id"></code></span>
+    <button id="btn-clear" class="btn btn-ghost" title="清空当前会话的全部数据与裁决">清空会话</button>
+  </div>
+</header>
+
+<main>
+  <!-- 1. 数据导入 -->
+  <section class="card" id="panel-import">
+    <h2>① 数据导入</h2>
+    <p class="hint">
+      CSV 需包含四列：<b>选手</b>、<b>评委</b>、<b>项目</b>、<b>分数</b>（中英文表头均可，如 contestant/judge/item/score）。
+      同一「选手 × 评委 × 项目」仅允许一条分数。
+    </p>
+    <div class="toolbar">
+      <label class="btn btn-primary">
+        上传 CSV
+        <input type="file" id="file-input" accept=".csv,text/csv" hidden>
+      </label>
+      <button id="btn-sample" class="btn">载入示例数据</button>
+      <div class="scope-switch">
+        校准范围：
+        <label><input type="radio" name="scope" value="judge" checked> 按评委（跨项目汇总）</label>
+        <label><input type="radio" name="scope" value="judge_item"> 按评委×项目</label>
+      </div>
+      <span id="import-msg" class="msg"></span>
+    </div>
+  </section>
+
+  <!-- 空状态 -->
+  <section id="empty-state" class="card empty">
+    <p>📄 暂无数据。请上传 CSV 或点击「载入示例数据」开始。</p>
+  </section>
+
+  <div id="dashboard" hidden>
+    <!-- 2. 校准参数与反转 -->
+    <section class="card">
+      <h2>② 稳健标准化与名次反转</h2>
+      <div id="reference-info" class="formula"></div>
+      <div id="stats-row" class="stats"></div>
+      <h3 class="sub">校准分组参数</h3>
+      <div id="group-table-wrap" class="table-wrap"></div>
+      <h3 class="sub">名次反转 <span id="reversal-count" class="badge"></span></h3>
+      <div id="reversal-panel"></div>
+    </section>
+
+    <!-- 3. 排名总表 -->
+    <section class="card">
+      <h2>③ 选手排名（实时）</h2>
+      <div class="toolbar">
+        <button id="btn-reset-decisions" class="btn btn-ghost">全部恢复采用校准分</button>
+        <button id="btn-export" class="btn btn-primary">导出审计 CSV</button>
+      </div>
+      <div id="rank-table-wrap" class="table-wrap"></div>
+    </section>
+
+    <!-- 4. 评分裁决规则批处理 -->
+    <section class="card">
+      <h2>④ 评分裁决规则批处理</h2>
+      <p class="hint">
+        按<b>评委、项目、原始分区间、校准分区间</b>组合条件（留空表示不限），批量指定「保留原分 / 采用校准分」与理由模板，
+        并为每条规则指定<b>优先级</b>（数字越小越优先，数字相同按规则顺序前者优先）。
+        先点「预览」查看每条规则的命中数、未命中数、多规则冲突及按优先级裁决后的唯一结果；预览只读，不会保存或改动裁决。
+        确认后点「应用」，系统将在<b>一个事务</b>中保存规则并批量写入裁决，随后自动刷新排名。
+        理由模板支持占位符：<code>{judge}</code> 评委、<code>{item}</code> 项目、<code>{raw}</code> 原始分、<code>{calibrated}</code> 校准分。
+      </p>
+      <div id="rules-editor"></div>
+      <div class="toolbar" style="margin-top:12px;">
+        <button id="btn-rule-add" class="btn">＋ 新增规则</button>
+        <button id="btn-rule-preview" class="btn btn-primary">预览命中与冲突（不保存）</button>
+        <button id="btn-rule-save" class="btn">仅保存规则</button>
+        <button id="btn-rule-apply" class="btn btn-primary">应用：保存规则并批量写入裁决</button>
+        <button id="btn-rule-clear" class="btn btn-ghost-card">清空全部规则</button>
+        <span id="rules-msg" class="msg"></span>
+      </div>
+      <div id="rules-preview" class="rules-preview"></div>
+    </section>
+
+    <!-- 5. 排名稳定性实验 -->
+    <section class="card">
+      <h2>⑤ 排名稳定性实验（临时模拟，不保存）</h2>
+      <p class="hint">
+        选择<b>临时排除一名评委或一个项目</b>，系统按当前校准范围重算原始分、校准分、最终总分与竞赛名次，
+        并逐位展示每位选手相对基线的名次/总分变化及被移除的评分条数。
+        实验结果仅保留在当前页面，<b>不会写入裁决或数据库</b>；上传、切换范围或修改裁决会自动清除实验结果，也可手动恢复基线。
+      </p>
+      <div class="toolbar stability-controls">
+        <select id="stability-type" class="select">
+          <option value="judge">排除评委</option>
+          <option value="item">排除项目</option>
+        </select>
+        <select id="stability-name" class="select"></select>
+        <button id="btn-stability-run" class="btn btn-primary">运行实验</button>
+        <button id="btn-stability-clear" class="btn btn-ghost" disabled>清除结果，恢复基线</button>
+        <span id="stability-msg" class="msg"></span>
+      </div>
+      <div id="stability-result" class="stability-result"></div>
+    </section>
+
+    <!-- 6. 逐项裁决 -->
+    <section class="card">
+      <h2>⑥ 逐项评分裁决</h2>
+      <p class="hint">对每条原始评分选择「采用校准分」或「保留原分」并填写理由，排名将实时重算。</p>
+      <div id="detail-panel"></div>
+    </section>
+  </div>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
